@@ -1,0 +1,58 @@
+{
+  "meta": [
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 1,
+      "chunk_id": 1,
+      "text": "COMPSCI 4SD3 Data-Driven Algorithms for Sequential Decision Making Assignment 1 Winter 2026 Sivan Sabato, McMaster University Due Date: See Avenue to Learn • Submit on the course’s Avenue to Learn website. • The answers to all the questions (including questions about the code part) must be typeset in Latex and submitted as a single pdf file (call it assignment.pdf). Submit the pdf file into the “questions part” assignment component in A2L. • The code for the programming task (Question 3 below) m"
+    },
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 1,
+      "chunk_id": 2,
+      "text": " Use of generative AI for assignments is strictly forbidden in this course, and will be con- sidered a violation of academic integrity. 1. [15 points] Answer the following questions using Hoeffding’s inequality and our adaptation to a general reward range. (a) Arm a has rewards in the range [0 , 10]. We pull arm a 32 times. We use Hoeffding’s inequality to guarantee that the probability that |ˆµa(n) − µa| < ϵ is at least 90%. What is the smallest value of ϵ that would make the statement above ho"
+    },
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 1,
+      "chunk_id": 3,
+      "text": "each arm m times, such that the following event holds with probability at least 93%: ∀i ∈ {1, 2, 3}, |ˆµai(n) − µai | < 0.1. What is the smallest m we can use? 2. [28 points] In the algorithm “successive elimination with known gaps”, consider the following scenario: α = 4, δ0 = 0.05, µa1 = 3, µa2 = 2, µa3 = 1.9, µa4 = 1.8. In the questions below, assume that the input to the algorithm specifies the true gaps ∆ 2, . . . ,∆4. In addition, assume that in each round i, |ˆµ(i) a1 − µa1 | < ϵ i and |ˆ"
+    },
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 2,
+      "chunk_id": 1,
+      "text": "(a) How many arm pulls will occur in round 1 for each arm in S? (b) Prove that a1 is not eliminated in round 1. (c) Will arm 4 necessarily be eliminated in round 1? Explain why or why not. (d) How many arm pulls will occur in round 2 for each arm in S? (e) Prove that a1 is not eliminated in round 2. (f) In Round 3, which arms (if any) are definitely in S? Explain. (g) Which arms (if any) are definitely not in S? Explain. 3. [7 points] In successive elimination with unknown gaps, prove that if th"
+    },
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 2,
+      "chunk_id": 2,
+      "text": "above). Implement two algorithms that we learned in class: (a) The uniform sampling algorithm (b) The successive elimination algorithm with known gaps. Technical instructions: • Download the necessary files from the coding assignment component on A2L. • Read the README.pdf file. Follow the instructions there to set up a python environment with the correct package versions, so that your code runs correctly when we test it on our system. • Each of the algorithms should be implemented as a function"
+    },
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 2,
+      "chunk_id": 3,
+      "text": "ithm runs just as we learned in class. When this parameter is larger than 1, you should divide all of the numbers of pulls that the algorithm calculates by this value. For instance, if the algorithm calculated that you need to pull an arm 36 times, and pull reduction is 3, then you should pull the arm only 36/3 = 12 times. If the result is not an integer, you should use the ceiling of the result. • Before submitting your code, make sure usage example.py runs correctly when combined with your sub"
+    },
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 2,
+      "chunk_id": 4,
+      "text": "ence scenarios to make sure it works correctly. • You can use the functions get true mean for each arm in your tests to verify that your algorithm works well, but you are not allowed to use them in your submitted code. 5. [20 points] Run each of the two algorithms that you implemented in the previous question on the following set of arms: 1. Bernoulli, p = 0.42 2"
+    },
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 3,
+      "chunk_id": 1,
+      "text": "2. Bernoulli, p = 0.43 3. Normal distribution with µ = 15.2 and σ = 2.5. 4. Normal distribution with µ = 16 and σ = 1. 5. Uniform on [0 , 2.5] 6. Uniform on [1 .24, 1.26] (a) What input arguments (other than the list of arms) do you need to provide each algorithm to find the best arm with a probability at least 0 .8? Explain the calculation of each value. (b) Run each algorithm with the above input arguments. What was the number of pulls for each algorithm? Which one was smaller and why? (c) Run"
+    },
+    {
+      "filename": "4SD3_W26_assignment1.pdf",
+      "page": 3,
+      "chunk_id": 2,
+      "text": " each algorithm, what was the percent of successful runs, where the algorithms provided the best arm? What can you conclude about the formulas that the algorithms are using for the number of required arm pulls? (e) [Bonus question: 5 additional points] When you ran the successive elimination algo- rithm 100 times with pull reduction = 1, when the algorithm was successful, did it always remove the arms in the order from the worst to the best? Describe what you observed and explain what you think "
+    }
+  ]
+}
