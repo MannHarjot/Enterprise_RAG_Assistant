@@ -17,6 +17,6 @@ A Dockerized, cloud-deployable web app that lets users upload PDFs and ask quest
 - Answers returned with citations: filename + page + chunk id
 - Works without paid LLM (extractive fallback)
 
-## Run with Docker (recommended)
+## Run with Docker
 ```bash
 docker compose up --build
