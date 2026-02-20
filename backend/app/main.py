@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from pypdf import PdfReader
 
-
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -53,6 +53,11 @@ GLOBAL_META_PATH = INDEX_DIR / "global.meta.json"
 
 def list_all_chunk_files() -> list[Path]:
     return sorted(CHUNKS_DIR.glob("*.chunks.json"))
+
+def verify_admin(request: Request):
+    api_key = request.headers.get("x-api-key")
+    if not ADMIN_API_KEY or api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Admin access required.")
 
 
 @app.middleware("http")
@@ -277,6 +282,7 @@ async def upload_pdf(request: Request, file: UploadFile = File(...)):
 
 @app.post("/index_global")
 def index_global(request: Request):
+    verify_admin(request)
     chunk_files = list_all_chunk_files()
     if not chunk_files:
         raise HTTPException(status_code=400, detail="No chunk files found. Upload PDFs first.")
@@ -303,6 +309,24 @@ def index_global(request: Request):
         "meta_file": GLOBAL_META_PATH.name,
     }
 
+@app.get("/admin/stats")
+def admin_stats(request: Request):
+    verify_admin(request)
+
+    num_pdfs = len(list(UPLOAD_DIR.glob("*.pdf")))
+    num_chunk_files = len(list(CHUNKS_DIR.glob("*.chunks.json")))
+    global_vectors = 0
+
+    if GLOBAL_INDEX_PATH.exists():
+        index = faiss.read_index(str(GLOBAL_INDEX_PATH))
+        global_vectors = index.ntotal
+
+    return {
+        "request_id": request.state.request_id,
+        "pdf_count": num_pdfs,
+        "chunk_files": num_chunk_files,
+        "global_vectors": global_vectors,
+    }
 @app.post("/index/{pdf_stem}")
 def index_document(pdf_stem: str, request: Request):
     try:
