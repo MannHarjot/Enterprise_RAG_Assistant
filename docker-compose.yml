@@ -9,5 +9,13 @@ services:
       - backend_storage:/app/storage
     restart: unless-stopped
 
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
 volumes:
   backend_storage:

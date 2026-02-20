@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "/api";
 
 export default function App() {
   const [file, setFile] = useState(null);
@@ -10,6 +10,7 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [globalMode, setGlobalMode] = useState(false);
 
   const selectedStem = useMemo(() => {
     if (!selectedDoc) return "";
@@ -70,36 +71,56 @@ export default function App() {
     setError("");
     setResult(null);
 
-    if (!selectedStem) {
-      setError("No document selected.");
-      return;
-    }
     if (!question.trim()) {
       setError("Type a question first.");
       return;
     }
 
+    // Only require a selected document in single-doc mode
+    if (!globalMode && !selectedStem) {
+      setError("No document selected.");
+      return;
+    }
+
     setBusy(true);
     try {
-      // Ensure index exists (safe to call repeatedly)
-      await fetch(`${API_BASE}/index/${encodeURIComponent(selectedStem)}`, {
-        method: "POST",
-      });
+      if (!globalMode) {
+        // Ensure per-doc index exists
+        await fetch(`${API_BASE}/index/${encodeURIComponent(selectedStem)}`, {
+          method: "POST",
+        });
 
-      const res = await fetch(`${API_BASE}/answer`, {
+        const res = await fetch(`${API_BASE}/answer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pdf_stem: selectedStem,
+            question,
+            top_k: 4,
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
+
+        setResult(data);
+        return;
+      }
+
+      // Global mode: build global index then ask global
+      await fetch(`${API_BASE}/index_global`, { method: "POST" });
+
+      const res = await fetch(`${API_BASE}/answer_global`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          pdf_stem: selectedStem,
           question,
-          top_k: 4,
+          top_k: 6,
         }),
       });
 
       const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || `Request failed (${res.status})`);
-      }
+      if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
 
       setResult(data);
     } catch (err) {
@@ -140,6 +161,8 @@ export default function App() {
               value={selectedDoc}
               onChange={(e) => setSelectedDoc(e.target.value)}
               style={{ padding: 8, minWidth: 260 }}
+              disabled={globalMode}
+              title={globalMode ? "Disabled in global mode" : ""}
             >
               {documents.length === 0 ? (
                 <option value="">No documents yet</option>
@@ -157,14 +180,23 @@ export default function App() {
             </button>
           </div>
 
+          <label style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12 }}>
+            <input
+              type="checkbox"
+              checked={globalMode}
+              onChange={(e) => setGlobalMode(e.target.checked)}
+            />
+            Search across all PDFs (global)
+          </label>
+
           <form onSubmit={handleAsk} style={{ marginTop: 12, display: "grid", gap: 10 }}>
             <input
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
-              placeholder="Ask: What is this document about?"
+              placeholder={globalMode ? "Ask across all PDFs..." : "Ask about selected PDF..."}
               style={{ padding: 10, fontSize: 14 }}
             />
-            <button disabled={busy || documents.length === 0} style={btnStyle}>
+            <button disabled={busy || (!globalMode && documents.length === 0)} style={btnStyle}>
               {busy ? "Working..." : "Ask"}
             </button>
           </form>

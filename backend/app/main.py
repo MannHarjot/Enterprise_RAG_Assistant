@@ -48,6 +48,12 @@ EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
 CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
+GLOBAL_INDEX_PATH = INDEX_DIR / "global.faiss"
+GLOBAL_META_PATH = INDEX_DIR / "global.meta.json"
+
+def list_all_chunk_files() -> list[Path]:
+    return sorted(CHUNKS_DIR.glob("*.chunks.json"))
+
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -154,6 +160,13 @@ def build_faiss_index(chunks: list[dict]) -> tuple[faiss.Index, list[dict]]:
 
     return index, meta
 
+def load_global_index() -> tuple[faiss.Index, list[dict]]:
+    if not GLOBAL_INDEX_PATH.exists() or not GLOBAL_META_PATH.exists():
+        raise FileNotFoundError("Global index not found. Run /index_global first.")
+
+    index = faiss.read_index(str(GLOBAL_INDEX_PATH))
+    meta = json.loads(GLOBAL_META_PATH.read_text(encoding="utf-8")).get("meta", [])
+    return index, meta
 
 def load_index(pdf_stem: str) -> tuple[faiss.Index, list[dict]]:
     index_path = INDEX_DIR / f"{pdf_stem}.faiss"
@@ -166,6 +179,26 @@ def load_index(pdf_stem: str) -> tuple[faiss.Index, list[dict]]:
     meta = json.loads(meta_path.read_text(encoding="utf-8")).get("meta", [])
     return index, meta
 
+def search_global(query: str, k: int = 6) -> list[dict]:
+    index, meta = load_global_index()
+
+    model = get_model()
+    q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+
+    scores, ids = index.search(q_emb, k)
+    results = []
+    for score, idx in zip(scores[0], ids[0]):
+        if idx == -1:
+            continue
+        m = meta[idx]
+        results.append({
+            "score": float(score),
+            "filename": m["filename"],
+            "page": m["page"],
+            "chunk_id": m["chunk_id"],
+            "snippet": m["text"],
+        })
+    return results
 
 def search(pdf_stem: str, query: str, k: int = 4) -> list[dict]:
     index, meta = load_index(pdf_stem)
@@ -242,6 +275,34 @@ async def upload_pdf(request: Request, file: UploadFile = File(...)):
     }
 
 
+@app.post("/index_global")
+def index_global(request: Request):
+    chunk_files = list_all_chunk_files()
+    if not chunk_files:
+        raise HTTPException(status_code=400, detail="No chunk files found. Upload PDFs first.")
+
+    all_chunks = []
+    for f in chunk_files:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        all_chunks.extend(data.get("chunks", []))
+
+    if not all_chunks:
+        raise HTTPException(status_code=400, detail="No chunks found to index.")
+
+    index, meta = build_faiss_index(all_chunks)
+
+    faiss.write_index(index, str(GLOBAL_INDEX_PATH))
+    GLOBAL_META_PATH.write_text(json.dumps({"meta": meta}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "request_id": request.state.request_id,
+        "status": "indexed_global",
+        "documents": len(chunk_files),
+        "vectors": index.ntotal,
+        "index_file": GLOBAL_INDEX_PATH.name,
+        "meta_file": GLOBAL_META_PATH.name,
+    }
+
 @app.post("/index/{pdf_stem}")
 def index_document(pdf_stem: str, request: Request):
     try:
@@ -293,6 +354,103 @@ def ask(req: AskRequest, request: Request):
         "matches": hits
     }
 
+class AnswerGlobalRequest(BaseModel):
+    question: str
+    top_k: int = 6
+
+@app.post("/answer_global")
+def answer_global(req: AnswerGlobalRequest, request: Request):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    try:
+        hits = search_global(req.question, k=req.top_k)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    # Guardrail: weak retrieval
+    if not hits or max(h["score"] for h in hits) < 0.03:
+        return {
+            "request_id": request.state.request_id,
+            "answer": "I don’t know based on the documents I have.",
+            "citations": [],
+            "mode": "no_support"
+        }
+
+    # No paid LLM → extractive answer
+    if client is None:
+        return {
+            "request_id": request.state.request_id,
+            "answer": extractive_answer(req.question, hits),
+            "citations": [
+                {
+                    "source_id": f"S{i+1}",
+                    "filename": h["filename"],
+                    "page": h["page"],
+                    "chunk_id": h["chunk_id"],
+                    "snippet": h["snippet"],
+                    "score": h["score"],
+                }
+                for i, h in enumerate(hits)
+            ],
+            "mode": "extractive_global",
+        }
+
+    # Build sources for LLM
+    context_lines = []
+    for i, h in enumerate(hits, start=1):
+        context_lines.append(
+            f"[S{i}] ({h['filename']}, page {h['page']}) {h['snippet']}"
+        )
+    context = "\n\n".join(context_lines)
+
+    instructions = (
+        "You are a document Q&A assistant. Answer ONLY using the provided sources.\n"
+        "If the answer is not contained in the sources, say: "
+        "\"I don’t know based on the documents I have.\".\n"
+        "Cite every factual statement using [S1], [S2], etc."
+    )
+
+    try:
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=instructions,
+            input=f"Question: {req.question}\n\nSources:\n{context}",
+        )
+    except OpenAIError:
+        return {
+            "request_id": request.state.request_id,
+            "answer": extractive_answer(req.question, hits),
+            "citations": [
+                {
+                    "source_id": f"S{i+1}",
+                    "filename": h["filename"],
+                    "page": h["page"],
+                    "chunk_id": h["chunk_id"],
+                    "snippet": h["snippet"],
+                    "score": h["score"],
+                }
+                for i, h in enumerate(hits)
+            ],
+            "mode": "extractive_global_fallback",
+        }
+
+    return {
+        "request_id": request.state.request_id,
+        "answer": response.output_text,
+        "citations": [
+            {
+                "source_id": f"S{i+1}",
+                "filename": h["filename"],
+                "page": h["page"],
+                "chunk_id": h["chunk_id"],
+                "snippet": h["snippet"],
+                "score": h["score"],
+            }
+            for i, h in enumerate(hits)
+        ],
+        "mode": "llm_global",
+    }
 
 class AnswerRequest(BaseModel):
     pdf_stem: str
@@ -404,3 +562,24 @@ def config_check(request: Request):
         "model": OPENAI_MODEL,
         "has_api_key": bool(OPENAI_API_KEY),
     }
+
+class AskGlobalRequest(BaseModel):
+    question: str
+    top_k: int = 6
+
+@app.post("/ask_global")
+def ask_global(req: AskGlobalRequest, request: Request):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    try:
+        hits = search_global(req.question, k=req.top_k)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return {
+        "request_id": request.state.request_id,
+        "question": req.question,
+        "matches": hits
+    }
+
