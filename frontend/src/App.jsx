@@ -119,7 +119,11 @@ export default function App() {
         return;
       }
 
-      await fetch(`${API_BASE}/index_global`, { method: "POST" });
+      const indexRes = await fetch(`${API_BASE}/index_global`, { method: "POST" });
+      if (!indexRes.ok) {
+        const indexData = await indexRes.json().catch(() => ({}));
+        throw new Error(indexData.detail || `Global indexing failed (${indexRes.status})`);
+      }
 
       const res = await fetch(`${API_BASE}/answer_global`, {
         method: "POST",

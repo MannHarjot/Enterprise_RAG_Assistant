@@ -98,8 +98,11 @@ def cleanup_global_index_if_present() -> list[str]:
     return removed
 
 def verify_admin(request: Request):
+    # If no admin key is configured, leave admin endpoints open for demo/dev use.
+    if not ADMIN_API_KEY:
+        return
     api_key = request.headers.get("x-api-key")
-    if not ADMIN_API_KEY or api_key != ADMIN_API_KEY:
+    if api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Admin access required.")
 
 
