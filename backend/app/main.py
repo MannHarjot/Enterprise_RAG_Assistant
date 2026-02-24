@@ -54,6 +54,41 @@ GLOBAL_META_PATH = INDEX_DIR / "global.meta.json"
 def list_all_chunk_files() -> list[Path]:
     return sorted(CHUNKS_DIR.glob("*.chunks.json"))
 
+
+def cleanup_document_artifacts(pdf_name: str) -> dict:
+    safe_name = Path(pdf_name).name
+    pdf_path = UPLOAD_DIR / safe_name
+    stem = pdf_path.stem
+
+    targets = [
+        pdf_path,
+        EXTRACT_DIR / f"{stem}.json",
+        CHUNKS_DIR / f"{stem}.chunks.json",
+        INDEX_DIR / f"{stem}.faiss",
+        INDEX_DIR / f"{stem}.meta.json",
+    ]
+
+    deleted = []
+    for path in targets:
+        if path.exists():
+            path.unlink()
+            deleted.append(path.name)
+
+    return {
+        "filename": safe_name,
+        "deleted_files": deleted,
+        "deleted": pdf_path.name in deleted,
+    }
+
+
+def cleanup_global_index_if_present() -> list[str]:
+    removed = []
+    for path in (GLOBAL_INDEX_PATH, GLOBAL_META_PATH):
+        if path.exists():
+            path.unlink()
+            removed.append(path.name)
+    return removed
+
 def verify_admin(request: Request):
     api_key = request.headers.get("x-api-key")
     if not ADMIN_API_KEY or api_key != ADMIN_API_KEY:
@@ -112,6 +147,47 @@ def health_check(request: Request):
 def list_documents(request: Request):
     pdfs = sorted([p.name for p in UPLOAD_DIR.glob("*.pdf")])
     return {"request_id": request.state.request_id, "documents": pdfs}
+
+
+@app.delete("/documents/{filename}")
+def delete_document(filename: str, request: Request):
+    result = cleanup_document_artifacts(filename)
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    global_deleted = cleanup_global_index_if_present()
+
+    return {
+        "request_id": request.state.request_id,
+        "status": "deleted_document",
+        "filename": result["filename"],
+        "deleted_files": result["deleted_files"],
+        "deleted_global_index_files": global_deleted,
+    }
+
+
+@app.delete("/documents")
+def delete_all_documents(request: Request):
+    pdfs = sorted([p.name for p in UPLOAD_DIR.glob("*.pdf")])
+
+    deleted_documents = []
+    deleted_files = []
+    for pdf_name in pdfs:
+        result = cleanup_document_artifacts(pdf_name)
+        if result["deleted"]:
+            deleted_documents.append(result["filename"])
+            deleted_files.extend(result["deleted_files"])
+
+    global_deleted = cleanup_global_index_if_present()
+
+    return {
+        "request_id": request.state.request_id,
+        "status": "deleted_all_documents",
+        "documents_deleted": len(deleted_documents),
+        "deleted_documents": deleted_documents,
+        "deleted_files": deleted_files,
+        "deleted_global_index_files": global_deleted,
+    }
 
 
 def extract_pages(pdf_path: Path) -> list[dict]:
@@ -606,4 +682,3 @@ def ask_global(req: AskGlobalRequest, request: Request):
         "question": req.question,
         "matches": hits
     }
-
