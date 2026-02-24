@@ -18,11 +18,21 @@ from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from pypdf import PdfReader
 
+load_dotenv()
+
+
+def parse_cors_origins() -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", "")
+    if raw.strip():
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=parse_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,8 +40,6 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rag_app")
-
-load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")

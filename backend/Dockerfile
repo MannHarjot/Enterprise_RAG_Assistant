@@ -18,4 +18,4 @@ RUN mkdir -p storage/uploads storage/extracted storage/chunks storage/index
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
