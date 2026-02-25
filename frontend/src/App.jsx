@@ -1,6 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
+const REQUEST_TIMEOUT_MS = 60000;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error(
+        "Request timed out. If you're on Render, check VITE_API_BASE_URL and backend CORS settings."
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 export default function App() {
   const fileInputRef = useRef(null);
@@ -20,7 +39,7 @@ export default function App() {
   }, [selectedDoc]);
 
   async function refreshDocs() {
-    const res = await fetch(`${API_BASE}/documents`);
+    const res = await fetchWithTimeout(`${API_BASE}/documents`, {}, 15000);
     const data = await res.json();
     const nextDocs = data.documents || [];
 
@@ -56,7 +75,7 @@ export default function App() {
       const form = new FormData();
       form.append("file", file);
 
-      const res = await fetch(`${API_BASE}/upload`, {
+      const res = await fetchWithTimeout(`${API_BASE}/upload`, {
         method: "POST",
         body: form,
       });
@@ -98,11 +117,18 @@ export default function App() {
     setBusy(true);
     try {
       if (!globalMode) {
-        await fetch(`${API_BASE}/index/${encodeURIComponent(selectedStem)}`, {
-          method: "POST",
-        });
+        const indexRes = await fetchWithTimeout(
+          `${API_BASE}/index/${encodeURIComponent(selectedStem)}`,
+          {
+            method: "POST",
+          }
+        );
+        if (!indexRes.ok) {
+          const indexData = await indexRes.json().catch(() => ({}));
+          throw new Error(indexData.detail || `Indexing failed (${indexRes.status})`);
+        }
 
-        const res = await fetch(`${API_BASE}/answer`, {
+        const answerRes = await fetchWithTimeout(`${API_BASE}/answer`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -112,20 +138,20 @@ export default function App() {
           }),
         });
 
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
+        const data = await answerRes.json();
+        if (!answerRes.ok) throw new Error(data.detail || `Request failed (${answerRes.status})`);
 
         setResult(data);
         return;
       }
 
-      const indexRes = await fetch(`${API_BASE}/index_global`, { method: "POST" });
+      const indexRes = await fetchWithTimeout(`${API_BASE}/index_global`, { method: "POST" });
       if (!indexRes.ok) {
         const indexData = await indexRes.json().catch(() => ({}));
         throw new Error(indexData.detail || `Global indexing failed (${indexRes.status})`);
       }
 
-      const res = await fetch(`${API_BASE}/answer_global`, {
+      const res = await fetchWithTimeout(`${API_BASE}/answer_global`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -153,7 +179,7 @@ export default function App() {
     setResult(null);
     setBusy(true);
     try {
-      const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(docName)}`, {
+      const res = await fetchWithTimeout(`${API_BASE}/documents/${encodeURIComponent(docName)}`, {
         method: "DELETE",
       });
       const data = await res.json().catch(() => ({}));
@@ -182,7 +208,7 @@ export default function App() {
     setResult(null);
     setBusy(true);
     try {
-      const res = await fetch(`${API_BASE}/documents`, { method: "DELETE" });
+      const res = await fetchWithTimeout(`${API_BASE}/documents`, { method: "DELETE" });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || `Delete all failed (${res.status})`);
 

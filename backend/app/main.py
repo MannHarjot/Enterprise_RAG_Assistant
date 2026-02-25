@@ -236,6 +236,7 @@ def load_chunks_for_pdf_stem(stem: str) -> list[dict]:
 
 def build_faiss_index(chunks: list[dict]) -> tuple[faiss.Index, list[dict]]:
     texts = [c["text"] for c in chunks]
+    logger.info("Building embeddings for %s chunks", len(texts))
     model = get_model()
     emb = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
     dim = emb.shape[1]
@@ -382,7 +383,12 @@ def index_global(request: Request):
     if not all_chunks:
         raise HTTPException(status_code=400, detail="No chunks found to index.")
 
-    index, meta = build_faiss_index(all_chunks)
+    try:
+        logger.info("[%s] Starting global index build for %s chunks", request.state.request_id, len(all_chunks))
+        index, meta = build_faiss_index(all_chunks)
+    except Exception:
+        logger.exception("[%s] Global index build failed", request.state.request_id)
+        raise
 
     faiss.write_index(index, str(GLOBAL_INDEX_PATH))
     GLOBAL_META_PATH.write_text(json.dumps({"meta": meta}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -424,7 +430,12 @@ def index_document(pdf_stem: str, request: Request):
     if not chunks:
         raise HTTPException(status_code=400, detail="No chunks found to index.")
 
-    index, meta = build_faiss_index(chunks)
+    try:
+        logger.info("[%s] Starting index build for %s (%s chunks)", request.state.request_id, pdf_stem, len(chunks))
+        index, meta = build_faiss_index(chunks)
+    except Exception:
+        logger.exception("[%s] Index build failed for %s", request.state.request_id, pdf_stem)
+        raise
 
     index_path = INDEX_DIR / f"{pdf_stem}.faiss"
     meta_path = INDEX_DIR / f"{pdf_stem}.meta.json"
