@@ -2,6 +2,9 @@
 
 A Dockerized, cloud-deployable web app that lets users upload PDFs and ask questions with answers grounded in the documents (with citations). Includes an extractive fallback mode when an LLM key/quota isn’t available.
 
+## Live Demo:
+https://enterprise-rag-assistant-1.onrender.com
+
 ## Tech Stack
 - **Backend:** FastAPI (Python)
 - **Embeddings:** Sentence-Transformers (all-MiniLM-L6-v2)
