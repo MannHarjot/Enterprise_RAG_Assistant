@@ -1,35 +1,56 @@
-from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
-from pathlib import Path
 import json
-import os
-
 import logging
+import os
+import shutil
 import uuid
+from pathlib import Path
+from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
-from openai import OpenAIError
-
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
-
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.embeddings import FastEmbedEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from pypdf import PdfReader
 
 load_dotenv()
 
+# ── Config ────────────────────────────────────────────────────────────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o")
+AUTH0_DOMAIN   = os.getenv("AUTH0_DOMAIN")
+AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")
+ROLES_CLAIM    = "https://rag-assistant-api/roles"
 
+# ── Storage ───────────────────────────────────────────────────────────────────
+UPLOAD_DIR = Path("storage/uploads")
+CHUNKS_DIR = Path("storage/chunks")
+INDEX_DIR  = Path("storage/index")
+for _d in (UPLOAD_DIR, CHUNKS_DIR, INDEX_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+GLOBAL_INDEX_DIR = INDEX_DIR / "global"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("rag_app")
+
+# ── App ───────────────────────────────────────────────────────────────────────
 def parse_cors_origins() -> list[str]:
     raw = os.getenv("CORS_ORIGINS", "")
     if raw.strip():
-        return [origin.strip() for origin in raw.split(",") if origin.strip()]
-    return ["http://localhost:5173", "http://127.0.0.1:5173"]
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return ["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173"]
 
-
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
-app = FastAPI()
+app = FastAPI(title="Enterprise RAG Assistant")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=parse_cors_origins(),
@@ -38,669 +59,491 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("rag_app")
+# ── Embeddings singleton ──────────────────────────────────────────────────────
+_embeddings: FastEmbedEmbeddings | None = None
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
+def get_embeddings() -> FastEmbedEmbeddings:
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = FastEmbedEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+    return _embeddings
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# ── Auth0 JWT validation ──────────────────────────────────────────────────────
+security     = HTTPBearer()
+_jwks_cache: dict | None = None
 
-UPLOAD_DIR = Path("storage/uploads")
-EXTRACT_DIR = Path("storage/extracted")
-CHUNKS_DIR = Path("storage/chunks")
-INDEX_DIR = Path("storage/index")
+def _get_jwks() -> dict:
+    global _jwks_cache
+    if _jwks_cache is None:
+        resp = httpx.get(
+            f"https://{AUTH0_DOMAIN}/.well-known/jwks.json", timeout=10
+        )
+        resp.raise_for_status()
+        _jwks_cache = resp.json()
+    return _jwks_cache
 
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
-CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
-INDEX_DIR.mkdir(parents=True, exist_ok=True)
+def _verify_token(token: str) -> dict:
+    if not AUTH0_DOMAIN or not AUTH0_AUDIENCE:
+        raise HTTPException(status_code=500, detail="Auth0 not configured on server.")
+    try:
+        jwks   = _get_jwks()
+        header = jwt.get_unverified_header(token)
+        rsa_key = next(
+            (
+                {"kty": k["kty"], "kid": k["kid"], "use": k["use"], "n": k["n"], "e": k["e"]}
+                for k in jwks["keys"]
+                if k["kid"] == header["kid"]
+            ),
+            None,
+        )
+        if not rsa_key:
+            raise HTTPException(status_code=401, detail="Matching public key not found.")
+        return jwt.decode(
+            token,
+            rsa_key,
+            algorithms=["RS256"],
+            audience=AUTH0_AUDIENCE,
+            issuer=f"https://{AUTH0_DOMAIN}/",
+        )
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
 
-GLOBAL_INDEX_PATH = INDEX_DIR / "global.faiss"
-GLOBAL_META_PATH = INDEX_DIR / "global.meta.json"
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
+    return _verify_token(credentials.credentials)
 
-def list_all_chunk_files() -> list[Path]:
-    return sorted(CHUNKS_DIR.glob("*.chunks.json"))
+def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if "admin" not in user.get(ROLES_CLAIM, []):
+        raise HTTPException(status_code=403, detail="Admin role required.")
+    return user
 
-
-def cleanup_document_artifacts(pdf_name: str) -> dict:
-    safe_name = Path(pdf_name).name
-    pdf_path = UPLOAD_DIR / safe_name
-    stem = pdf_path.stem
-
-    targets = [
-        pdf_path,
-        EXTRACT_DIR / f"{stem}.json",
-        CHUNKS_DIR / f"{stem}.chunks.json",
-        INDEX_DIR / f"{stem}.faiss",
-        INDEX_DIR / f"{stem}.meta.json",
-    ]
-
-    deleted = []
-    for path in targets:
-        if path.exists():
-            path.unlink()
-            deleted.append(path.name)
-
-    return {
-        "filename": safe_name,
-        "deleted_files": deleted,
-        "deleted": pdf_path.name in deleted,
-    }
-
-
-def cleanup_global_index_if_present() -> list[str]:
-    removed = []
-    for path in (GLOBAL_INDEX_PATH, GLOBAL_META_PATH):
-        if path.exists():
-            path.unlink()
-            removed.append(path.name)
-    return removed
-
-def verify_admin(request: Request):
-    # If no admin key is configured, leave admin endpoints open for demo/dev use.
-    if not ADMIN_API_KEY:
-        return
-    api_key = request.headers.get("x-api-key")
-    if api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=403, detail="Admin access required.")
-
-
+# ── Request-ID middleware ─────────────────────────────────────────────────────
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-    request.state.request_id = request_id
-
-    logger.info(f"[{request_id}] {request.method} {request.url.path}")
-
+    rid = request.headers.get("x-request-id", str(uuid.uuid4()))
+    request.state.request_id = rid
+    logger.info("[%s] %s %s", rid, request.method, request.url.path)
     response = await call_next(request)
-    response.headers["x-request-id"] = request_id
+    response.headers["x-request-id"] = rid
     return response
 
+# ── Storage helpers ───────────────────────────────────────────────────────────
+def _remove_path(p: Path):
+    if p.is_dir():
+        shutil.rmtree(p)
+    elif p.exists():
+        p.unlink()
 
-def extractive_answer(question: str, hits: list[dict]) -> str:
-    if not hits:
-        return "I don’t know based on the documents I have."
+def cleanup_document(pdf_name: str) -> dict:
+    safe  = Path(pdf_name).name
+    stem  = Path(safe).stem
+    paths = [
+        UPLOAD_DIR / safe,
+        CHUNKS_DIR / f"{stem}.chunks.json",
+        INDEX_DIR  / stem,
+    ]
+    deleted = []
+    for p in paths:
+        if p.exists():
+            _remove_path(p)
+            deleted.append(p.name)
+    return {"filename": safe, "deleted_files": deleted, "deleted": safe in deleted}
 
-    top = hits[:2]
-    combined = "\n\n".join(
-        [f"{h['snippet']} [S{i+1}]" for i, h in enumerate(top)]
+def cleanup_global_index():
+    _remove_path(GLOBAL_INDEX_DIR)
+
+# ── LangChain helpers ─────────────────────────────────────────────────────────
+def _load_vectorstore(index_dir: Path) -> FAISS:
+    return FAISS.load_local(
+        str(index_dir), get_embeddings(), allow_dangerous_deserialization=True
     )
 
-    return (
-        "Based on the document passages, here’s the most relevant information:\n\n"
-        f"{combined}"
-    )
+def _search(vectorstore: FAISS, question: str, k: int) -> list[dict]:
+    results = vectorstore.similarity_search_with_relevance_scores(question, k=k)
+    return [
+        {
+            "score":    float(score),
+            "filename": doc.metadata.get("filename", ""),
+            "page":     doc.metadata.get("page", 0),
+            "chunk_id": doc.metadata.get("chunk_id", 0),
+            "snippet":  doc.page_content[:500],
+        }
+        for doc, score in results
+    ]
 
+_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are a document Q&A assistant. Use the provided source passages to answer the question.\n"
+        "Synthesize relevant information across sources — you do not need a verbatim quote to answer.\n"
+        "Only say \"I don't know based on the documents I have.\" if the sources contain "
+        "NO information relevant to the question whatsoever.\n"
+        "Cite every factual claim using [S1], [S2], etc.\n\n"
+        "Sources:\n{context}\n\n"
+        "Question: {question}\n\nAnswer:"
+    ),
+)
 
-_model = None
-def get_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _model
+def _build_answer(question: str, hits: list[dict], request_id: str, mode: str) -> dict:
+    citations = [{"source_id": f"S{i+1}", **h} for i, h in enumerate(hits)]
 
+    if not OPENAI_API_KEY:
+        answer = "Based on the document passages:\n\n" + "\n\n".join(
+            f"{h['snippet']} [S{i+1}]" for i, h in enumerate(hits[:2])
+        )
+        return {"request_id": request_id, "answer": answer, "citations": citations, "mode": f"extractive_{mode}"}
 
+    try:
+        llm     = ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY)
+        context = "\n\n".join(
+            f"[S{i+1}] ({h['filename']}, page {h['page']}) {h['snippet']}"
+            for i, h in enumerate(hits)
+        )
+        chain  = _PROMPT | llm
+        result = chain.invoke({"context": context, "question": question})
+        answer = result.content if hasattr(result, "content") else str(result)
+        return {"request_id": request_id, "answer": answer, "citations": citations, "mode": f"llm_{mode}"}
+    except Exception:
+        logger.exception("LLM call failed, using extractive fallback")
+        answer = "Based on the document passages:\n\n" + "\n\n".join(
+            f"{h['snippet']} [S{i+1}]" for i, h in enumerate(hits[:2])
+        )
+        return {"request_id": request_id, "answer": answer, "citations": citations, "mode": f"extractive_{mode}_fallback"}
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root(request: Request):
-    return {
-        "request_id": request.state.request_id,
-        "message": "Enterprise RAG Assistant is running 🚀",
-    }
-
+    return {"request_id": request.state.request_id, "message": "Enterprise RAG Assistant"}
 
 @app.get("/health")
-def health_check(request: Request):
-    return {"request_id": request.state.request_id, "status": "ok"}
-
-
-@app.get("/documents")
-def list_documents(request: Request):
-    pdfs = sorted([p.name for p in UPLOAD_DIR.glob("*.pdf")])
-    return {"request_id": request.state.request_id, "documents": pdfs}
-
-
-@app.delete("/documents/{filename}")
-def delete_document(filename: str, request: Request):
-    result = cleanup_document_artifacts(filename)
-    if not result["deleted"]:
-        raise HTTPException(status_code=404, detail="Document not found.")
-
-    global_deleted = cleanup_global_index_if_present()
-
-    return {
-        "request_id": request.state.request_id,
-        "status": "deleted_document",
-        "filename": result["filename"],
-        "deleted_files": result["deleted_files"],
-        "deleted_global_index_files": global_deleted,
-    }
-
-
-@app.delete("/documents")
-def delete_all_documents(request: Request):
-    pdfs = sorted([p.name for p in UPLOAD_DIR.glob("*.pdf")])
-
-    deleted_documents = []
-    deleted_files = []
-    for pdf_name in pdfs:
-        result = cleanup_document_artifacts(pdf_name)
-        if result["deleted"]:
-            deleted_documents.append(result["filename"])
-            deleted_files.extend(result["deleted_files"])
-
-    global_deleted = cleanup_global_index_if_present()
-
-    return {
-        "request_id": request.state.request_id,
-        "status": "deleted_all_documents",
-        "documents_deleted": len(deleted_documents),
-        "deleted_documents": deleted_documents,
-        "deleted_files": deleted_files,
-        "deleted_global_index_files": global_deleted,
-    }
-
-
-def extract_pages(pdf_path: Path) -> list[dict]:
-    reader = PdfReader(str(pdf_path))
-    pages = []
-    for i, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        pages.append({"page": i, "text": text})
-    return pages
-
-
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> list[str]:
-    text = " ".join(text.split())
-    if not text:
-        return []
-
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        chunks.append(text[start:end])
-        if end == len(text):
-            break
-        start = max(0, end - overlap)
-    return chunks
-
-
-def load_chunks_for_pdf_stem(stem: str) -> list[dict]:
-    chunks_file = CHUNKS_DIR / f"{stem}.chunks.json"
-    if not chunks_file.exists():
-        raise FileNotFoundError(f"Chunks file not found: {chunks_file.name}")
-    data = json.loads(chunks_file.read_text(encoding="utf-8"))
-    return data.get("chunks", [])
-
-
-def build_faiss_index(chunks: list[dict]) -> tuple[faiss.Index, list[dict]]:
-    texts = [c["text"] for c in chunks]
-    logger.info("Building embeddings for %s chunks", len(texts))
-    model = get_model()
-    emb = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-    dim = emb.shape[1]
-
-    index = faiss.IndexFlatIP(dim)
-    index.add(emb.astype(np.float32))
-
-    meta = [{
-        "filename": c["filename"],
-        "page": c["page"],
-        "chunk_id": c["chunk_id"],
-        "text": c["text"][:500]
-    } for c in chunks]
-
-    return index, meta
-
-def load_global_index() -> tuple[faiss.Index, list[dict]]:
-    if not GLOBAL_INDEX_PATH.exists() or not GLOBAL_META_PATH.exists():
-        raise FileNotFoundError("Global index not found. Run /index_global first.")
-
-    index = faiss.read_index(str(GLOBAL_INDEX_PATH))
-    meta = json.loads(GLOBAL_META_PATH.read_text(encoding="utf-8")).get("meta", [])
-    return index, meta
-
-def load_index(pdf_stem: str) -> tuple[faiss.Index, list[dict]]:
-    index_path = INDEX_DIR / f"{pdf_stem}.faiss"
-    meta_path = INDEX_DIR / f"{pdf_stem}.meta.json"
-
-    if not index_path.exists() or not meta_path.exists():
-        raise FileNotFoundError("Index not found. Run /index/{pdf_stem} first.")
-
-    index = faiss.read_index(str(index_path))
-    meta = json.loads(meta_path.read_text(encoding="utf-8")).get("meta", [])
-    return index, meta
-
-def search_global(query: str, k: int = 6) -> list[dict]:
-    index, meta = load_global_index()
-
-    model = get_model()
-    q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-
-    scores, ids = index.search(q_emb, k)
-    results = []
-    for score, idx in zip(scores[0], ids[0]):
-        if idx == -1:
-            continue
-        m = meta[idx]
-        results.append({
-            "score": float(score),
-            "filename": m["filename"],
-            "page": m["page"],
-            "chunk_id": m["chunk_id"],
-            "snippet": m["text"],
-        })
-    return results
-
-def search(pdf_stem: str, query: str, k: int = 4) -> list[dict]:
-    index, meta = load_index(pdf_stem)
-
-    model = get_model()
-    q_emb = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-
-    scores, ids = index.search(q_emb, k)
-    results = []
-    for score, idx in zip(scores[0], ids[0]):
-        if idx == -1:
-            continue
-        m = meta[idx]
-        results.append({
-            "score": float(score),
-            "filename": m["filename"],
-            "page": m["page"],
-            "chunk_id": m["chunk_id"],
-            "snippet": m["text"],
-        })
-    return results
-
-
-@app.post("/upload")
-async def upload_pdf(request: Request, file: UploadFile = File(...)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
-
-    safe_name = Path(file.filename).name
-    pdf_path = UPLOAD_DIR / safe_name
-
-    data = await file.read()
-    pdf_path.write_bytes(data)
-
-    pages = extract_pages(pdf_path)
-
-    all_chunks = []
-    for p in pages:
-        for idx, c in enumerate(chunk_text(p["text"]), start=1):
-            all_chunks.append({
-                "filename": safe_name,
-                "page": p["page"],
-                "chunk_id": idx,
-                "text": c
-            })
-
-    out_path = EXTRACT_DIR / f"{pdf_path.stem}.json"
-    out_path.write_text(
-        json.dumps({"filename": safe_name, "pages": pages}, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-    chunks_path = CHUNKS_DIR / f"{pdf_path.stem}.chunks.json"
-    chunks_path.write_text(
-        json.dumps({"filename": safe_name, "chunks": all_chunks}, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-    preview = ""
-    for p in pages:
-        if p["text"].strip():
-            preview = p["text"][:300]
-            break
-
-    return {
-        "request_id": request.state.request_id,
-        "status": "saved_and_extracted",
-        "filename": safe_name,
-        "pages": len(pages),
-        "chunks": len(all_chunks),
-        "preview": preview,
-        "extracted_json": out_path.name,
-        "chunks_json": chunks_path.name,
-    }
-
-
-@app.post("/index_global")
-def index_global(request: Request):
-    verify_admin(request)
-    chunk_files = list_all_chunk_files()
-    if not chunk_files:
-        raise HTTPException(status_code=400, detail="No chunk files found. Upload PDFs first.")
-
-    all_chunks = []
-    for f in chunk_files:
-        data = json.loads(f.read_text(encoding="utf-8"))
-        all_chunks.extend(data.get("chunks", []))
-
-    if not all_chunks:
-        raise HTTPException(status_code=400, detail="No chunks found to index.")
-
-    try:
-        logger.info("[%s] Starting global index build for %s chunks", request.state.request_id, len(all_chunks))
-        index, meta = build_faiss_index(all_chunks)
-    except Exception:
-        logger.exception("[%s] Global index build failed", request.state.request_id)
-        raise
-
-    faiss.write_index(index, str(GLOBAL_INDEX_PATH))
-    GLOBAL_META_PATH.write_text(json.dumps({"meta": meta}, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return {
-        "request_id": request.state.request_id,
-        "status": "indexed_global",
-        "documents": len(chunk_files),
-        "vectors": index.ntotal,
-        "index_file": GLOBAL_INDEX_PATH.name,
-        "meta_file": GLOBAL_META_PATH.name,
-    }
-
-@app.get("/admin/stats")
-def admin_stats(request: Request):
-    verify_admin(request)
-
-    num_pdfs = len(list(UPLOAD_DIR.glob("*.pdf")))
-    num_chunk_files = len(list(CHUNKS_DIR.glob("*.chunks.json")))
-    global_vectors = 0
-
-    if GLOBAL_INDEX_PATH.exists():
-        index = faiss.read_index(str(GLOBAL_INDEX_PATH))
-        global_vectors = index.ntotal
-
-    return {
-        "request_id": request.state.request_id,
-        "pdf_count": num_pdfs,
-        "chunk_files": num_chunk_files,
-        "global_vectors": global_vectors,
-    }
-@app.post("/index/{pdf_stem}")
-def index_document(pdf_stem: str, request: Request):
-    try:
-        chunks = load_chunks_for_pdf_stem(pdf_stem)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No chunks found to index.")
-
-    try:
-        logger.info("[%s] Starting index build for %s (%s chunks)", request.state.request_id, pdf_stem, len(chunks))
-        index, meta = build_faiss_index(chunks)
-    except Exception:
-        logger.exception("[%s] Index build failed for %s", request.state.request_id, pdf_stem)
-        raise
-
-    index_path = INDEX_DIR / f"{pdf_stem}.faiss"
-    meta_path = INDEX_DIR / f"{pdf_stem}.meta.json"
-
-    faiss.write_index(index, str(index_path))
-    meta_path.write_text(json.dumps({"meta": meta}, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return {
-        "request_id": request.state.request_id,
-        "status": "indexed",
-        "pdf_stem": pdf_stem,
-        "vectors": index.ntotal,
-        "index_file": index_path.name,
-        "meta_file": meta_path.name
-    }
-
-
-class AskRequest(BaseModel):
-    pdf_stem: str
-    question: str
-    top_k: int = 4
-
-
-@app.post("/ask")
-def ask(req: AskRequest, request: Request):
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    try:
-        hits = search(req.pdf_stem, req.question, k=req.top_k)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    return {
-        "request_id": request.state.request_id,
-        "question": req.question,
-        "pdf_stem": req.pdf_stem,
-        "matches": hits
-    }
-
-class AnswerGlobalRequest(BaseModel):
-    question: str
-    top_k: int = 6
-
-@app.post("/answer_global")
-def answer_global(req: AnswerGlobalRequest, request: Request):
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    try:
-        hits = search_global(req.question, k=req.top_k)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    # Guardrail: weak retrieval
-    if not hits or max(h["score"] for h in hits) < 0.03:
-        return {
-            "request_id": request.state.request_id,
-            "answer": "I don’t know based on the documents I have.",
-            "citations": [],
-            "mode": "no_support"
-        }
-
-    # No paid LLM → extractive answer
-    if client is None:
-        return {
-            "request_id": request.state.request_id,
-            "answer": extractive_answer(req.question, hits),
-            "citations": [
-                {
-                    "source_id": f"S{i+1}",
-                    "filename": h["filename"],
-                    "page": h["page"],
-                    "chunk_id": h["chunk_id"],
-                    "snippet": h["snippet"],
-                    "score": h["score"],
-                }
-                for i, h in enumerate(hits)
-            ],
-            "mode": "extractive_global",
-        }
-
-    # Build sources for LLM
-    context_lines = []
-    for i, h in enumerate(hits, start=1):
-        context_lines.append(
-            f"[S{i}] ({h['filename']}, page {h['page']}) {h['snippet']}"
-        )
-    context = "\n\n".join(context_lines)
-
-    instructions = (
-        "You are a document Q&A assistant. Answer ONLY using the provided sources.\n"
-        "If the answer is not contained in the sources, say: "
-        "\"I don’t know based on the documents I have.\".\n"
-        "Cite every factual statement using [S1], [S2], etc."
-    )
-
-    try:
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            instructions=instructions,
-            input=f"Question: {req.question}\n\nSources:\n{context}",
-        )
-    except OpenAIError:
-        return {
-            "request_id": request.state.request_id,
-            "answer": extractive_answer(req.question, hits),
-            "citations": [
-                {
-                    "source_id": f"S{i+1}",
-                    "filename": h["filename"],
-                    "page": h["page"],
-                    "chunk_id": h["chunk_id"],
-                    "snippet": h["snippet"],
-                    "score": h["score"],
-                }
-                for i, h in enumerate(hits)
-            ],
-            "mode": "extractive_global_fallback",
-        }
-
-    return {
-        "request_id": request.state.request_id,
-        "answer": response.output_text,
-        "citations": [
-            {
-                "source_id": f"S{i+1}",
-                "filename": h["filename"],
-                "page": h["page"],
-                "chunk_id": h["chunk_id"],
-                "snippet": h["snippet"],
-                "score": h["score"],
-            }
-            for i, h in enumerate(hits)
-        ],
-        "mode": "llm_global",
-    }
-
-class AnswerRequest(BaseModel):
-    pdf_stem: str
-    question: str
-    top_k: int = 4
-
-
-@app.post("/answer")
-def answer(req: AnswerRequest, request: Request):
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    try:
-        hits = search(req.pdf_stem, req.question, k=req.top_k)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    if not hits or max(h["score"] for h in hits) < 0.03:
-        return {
-            "request_id": request.state.request_id,
-            "answer": "I don’t know based on the documents I have.",
-            "citations": [],
-            "matches": hits,
-            "mode": "no_support"
-        }
-
-    if client is None:
-        return {
-            "request_id": request.state.request_id,
-            "answer": extractive_answer(req.question, hits),
-            "citations": [
-                {
-                    "source_id": f"S{i+1}",
-                    "filename": h["filename"],
-                    "page": h["page"],
-                    "chunk_id": h["chunk_id"],
-                    "snippet": h["snippet"],
-                    "score": h["score"],
-                }
-                for i, h in enumerate(hits)
-            ],
-            "matches": hits,
-            "mode": "extractive",
-        }
-
-    context_lines = []
-    for i, h in enumerate(hits, start=1):
-        context_lines.append(
-            f"[S{i}] ({h['filename']}, page {h['page']}) {h['snippet']}"
-        )
-    context = "\n\n".join(context_lines)
-
-    instructions = (
-        "You are a document Q&A assistant. "
-        "Answer ONLY using the provided sources.\n"
-        "If the answer is not contained in the sources, say: "
-        "\"I don’t know based on the documents I have.\".\n"
-        "Cite every factual statement using [S1], [S2], etc."
-    )
-
-    try:
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            instructions=instructions,
-            input=f"Question: {req.question}\n\nSources:\n{context}",
-        )
-    except OpenAIError:
-        return {
-            "request_id": request.state.request_id,
-            "answer": extractive_answer(req.question, hits),
-            "citations": [
-                {
-                    "source_id": f"S{i+1}",
-                    "filename": h["filename"],
-                    "page": h["page"],
-                    "chunk_id": h["chunk_id"],
-                    "snippet": h["snippet"],
-                    "score": h["score"],
-                }
-                for i, h in enumerate(hits)
-            ],
-            "matches": hits,
-            "mode": "extractive_fallback",
-        }
-
-    return {
-        "request_id": request.state.request_id,
-        "answer": response.output_text,
-        "citations": [
-            {
-                "source_id": f"S{i+1}",
-                "filename": h["filename"],
-                "page": h["page"],
-                "chunk_id": h["chunk_id"],
-                "snippet": h["snippet"],
-                "score": h["score"],
-            }
-            for i, h in enumerate(hits)
-        ],
-        "matches": hits,
-        "mode": "llm",
-    }
-
+def health():
+    return {"status": "ok"}
 
 @app.get("/config")
 def config_check(request: Request):
     return {
         "request_id": request.state.request_id,
-        "model": OPENAI_MODEL,
+        "model":       OPENAI_MODEL,
         "has_api_key": bool(OPENAI_API_KEY),
     }
 
-class AskGlobalRequest(BaseModel):
-    question: str
-    top_k: int = 6
+@app.get("/documents")
+def list_documents(request: Request, user: dict = Depends(get_current_user)):
+    pdfs = sorted(p.name for p in UPLOAD_DIR.glob("*.pdf"))
+    return {"request_id": request.state.request_id, "documents": pdfs}
 
-@app.post("/ask_global")
-def ask_global(req: AskGlobalRequest, request: Request):
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+# ── Upload (admin only) ───────────────────────────────────────────────────────
+@app.post("/upload")
+async def upload_pdf(
+    request: Request,
+    file: UploadFile = File(...),
+    user: dict = Depends(require_admin),
+):
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
 
-    try:
-        hits = search_global(req.question, k=req.top_k)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    safe_name = Path(file.filename).name
+    pdf_path  = UPLOAD_DIR / safe_name
+    pdf_path.write_bytes(await file.read())
 
+    # LangChain: load pages and split into chunks
+    loader   = PyPDFLoader(str(pdf_path))
+    pages    = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    chunks   = splitter.split_documents(pages)
+
+    for i, chunk in enumerate(chunks):
+        chunk.metadata["filename"] = safe_name
+        chunk.metadata["chunk_id"] = i + 1
+        chunk.metadata["page"]     = int(chunk.metadata.get("page", 0)) + 1  # 1-indexed
+
+    # Persist chunks as JSON for global indexing
+    chunks_data = [
+        {"text": c.page_content, "filename": c.metadata["filename"],
+         "page": c.metadata["page"], "chunk_id": c.metadata["chunk_id"]}
+        for c in chunks
+    ]
+    (CHUNKS_DIR / f"{pdf_path.stem}.chunks.json").write_text(
+        json.dumps({"filename": safe_name, "chunks": chunks_data}, indent=2)
+    )
+
+    preview = chunks[0].page_content[:300] if chunks else ""
     return {
         "request_id": request.state.request_id,
-        "question": req.question,
-        "matches": hits
+        "status":     "uploaded",
+        "filename":   safe_name,
+        "pages":      len(pages),
+        "chunks":     len(chunks),
+        "preview":    preview,
+    }
+
+# ── Indexing ──────────────────────────────────────────────────────────────────
+@app.post("/index/{pdf_stem}")
+def index_document(pdf_stem: str, request: Request, user: dict = Depends(get_current_user)):
+    chunks_file = CHUNKS_DIR / f"{pdf_stem}.chunks.json"
+    if not chunks_file.exists():
+        raise HTTPException(status_code=404, detail=f"No chunks found for '{pdf_stem}'. Upload PDF first.")
+
+    data   = json.loads(chunks_file.read_text())
+    chunks = data.get("chunks", [])
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No chunks to index.")
+
+    docs = [
+        Document(
+            page_content=c["text"],
+            metadata={"filename": c["filename"], "page": c["page"], "chunk_id": c["chunk_id"]},
+        )
+        for c in chunks
+    ]
+
+    logger.info("[%s] Indexing %s (%d chunks)", request.state.request_id, pdf_stem, len(docs))
+    vs = FAISS.from_documents(docs, get_embeddings())
+    vs.save_local(str(INDEX_DIR / pdf_stem))
+
+    return {"request_id": request.state.request_id, "status": "indexed", "pdf_stem": pdf_stem, "vectors": len(docs)}
+
+@app.post("/index_global")
+def index_global(request: Request, user: dict = Depends(get_current_user)):
+    chunk_files = sorted(CHUNKS_DIR.glob("*.chunks.json"))
+    if not chunk_files:
+        raise HTTPException(status_code=400, detail="No PDFs uploaded yet.")
+
+    all_docs = []
+    for f in chunk_files:
+        for c in json.loads(f.read_text()).get("chunks", []):
+            all_docs.append(Document(
+                page_content=c["text"],
+                metadata={"filename": c["filename"], "page": c["page"], "chunk_id": c["chunk_id"]},
+            ))
+
+    if not all_docs:
+        raise HTTPException(status_code=400, detail="No chunks found.")
+
+    logger.info("[%s] Building global index (%d chunks)", request.state.request_id, len(all_docs))
+    vs = FAISS.from_documents(all_docs, get_embeddings())
+    vs.save_local(str(GLOBAL_INDEX_DIR))
+
+    return {"request_id": request.state.request_id, "status": "indexed_global", "vectors": len(all_docs)}
+
+# ── Answer ────────────────────────────────────────────────────────────────────
+class AnswerRequest(BaseModel):
+    pdf_stem: str
+    question: str
+    top_k:    int = 4
+
+@app.post("/answer")
+def answer(req: AnswerRequest, request: Request, user: dict = Depends(get_current_user)):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    logger.info("[answer] question=%r pdf_stem=%r", req.question, req.pdf_stem)
+
+    index_path = INDEX_DIR / req.pdf_stem
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Index not found. Run /index/{pdf_stem} first.")
+
+    vs   = _load_vectorstore(index_path)
+    hits = _search(vs, req.question, req.top_k)
+
+    if not hits:
+        return {"request_id": request.state.request_id, "answer": "I don't know based on the documents I have.", "citations": [], "mode": "no_support"}
+
+    return _build_answer(req.question, hits, request.state.request_id, "doc")
+
+class AnswerGlobalRequest(BaseModel):
+    question: str
+    top_k:    int = 6
+
+@app.post("/answer_global")
+def answer_global(req: AnswerGlobalRequest, request: Request, user: dict = Depends(get_current_user)):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    logger.info("[answer_global] question=%r", req.question)
+
+    if not GLOBAL_INDEX_DIR.exists():
+        raise HTTPException(status_code=404, detail="Global index not found. Run /index_global first.")
+
+    vs   = _load_vectorstore(GLOBAL_INDEX_DIR)
+    hits = _search(vs, req.question, req.top_k)
+
+    if not hits:
+        return {"request_id": request.state.request_id, "answer": "I don't know based on the documents I have.", "citations": [], "mode": "no_support"}
+
+    return _build_answer(req.question, hits, request.state.request_id, "global")
+
+# ── Delete (admin only) ───────────────────────────────────────────────────────
+@app.delete("/documents/{filename}")
+def delete_document(filename: str, request: Request, user: dict = Depends(require_admin)):
+    result = cleanup_document(filename)
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    cleanup_global_index()
+    return {"request_id": request.state.request_id, "status": "deleted", **result}
+
+@app.delete("/documents")
+def delete_all_documents(request: Request, user: dict = Depends(require_admin)):
+    pdfs    = [p.name for p in UPLOAD_DIR.glob("*.pdf")]
+    deleted = [n for n in pdfs if cleanup_document(n)["deleted"]]
+    cleanup_global_index()
+    return {"request_id": request.state.request_id, "status": "deleted_all", "count": len(deleted), "deleted": deleted}
+
+@app.get("/admin/stats")
+def admin_stats(request: Request, user: dict = Depends(require_admin)):
+    num_pdfs   = len(list(UPLOAD_DIR.glob("*.pdf")))
+    num_chunks = len(list(CHUNKS_DIR.glob("*.chunks.json")))
+    global_vectors = 0
+    if GLOBAL_INDEX_DIR.exists():
+        vs = _load_vectorstore(GLOBAL_INDEX_DIR)
+        global_vectors = vs.index.ntotal
+    return {
+        "request_id":    request.state.request_id,
+        "pdf_count":     num_pdfs,
+        "chunk_files":   num_chunks,
+        "global_vectors": global_vectors,
+    }
+
+# ── LangGraph Agentic RAG ─────────────────────────────────────────────────────
+from typing import TypedDict
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage
+
+class RAGState(TypedDict):
+    question:        str
+    pdf_stem:        Optional[str]
+    available_docs:  list[str]
+    rewritten_query: str
+    search_mode:     str        # "single" | "global"
+    hits:            list[dict]
+    answer:          str
+    citations:       list[dict]
+    reasoning:       str
+
+def _node_route_and_rewrite(state: RAGState) -> RAGState:
+    """Agent node: decide search strategy and rewrite query for better retrieval."""
+    if not OPENAI_API_KEY:
+        mode = "single" if state["pdf_stem"] else "global"
+        return {**state, "rewritten_query": state["question"],
+                "search_mode": mode, "reasoning": "Direct search (no LLM routing available)."}
+
+    docs_list = ", ".join(state["available_docs"]) if state["available_docs"] else "none"
+    llm = ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY, temperature=0)
+
+    prompt = (
+        f'You are a routing agent for a document Q&A system.\n'
+        f'User question: "{state["question"]}"\n'
+        f'Available documents: {docs_list}\n'
+        f'Hinted document: {state["pdf_stem"] or "none"}\n\n'
+        f'Tasks:\n'
+        f'1. Rewrite the question to be more specific for semantic search (remove filler, add context).\n'
+        f'2. Choose search_mode: "single" if question targets a specific hinted document, "global" otherwise.\n\n'
+        f'Respond ONLY as valid JSON:\n'
+        f'{{"rewritten_query": "...", "search_mode": "single|global", "reasoning": "one sentence explanation"}}'
+    )
+
+    try:
+        result  = llm.invoke([HumanMessage(content=prompt)])
+        raw     = result.content.strip()
+        # GPT-4o sometimes wraps JSON in markdown fences — strip them
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.rsplit("```", 1)[0].strip()
+        parsed  = json.loads(raw)
+        return {
+            **state,
+            "rewritten_query": parsed.get("rewritten_query", state["question"]),
+            "search_mode":     parsed.get("search_mode", "global"),
+            "reasoning":       parsed.get("reasoning", ""),
+        }
+    except Exception:
+        mode = "single" if state["pdf_stem"] else "global"
+        return {**state, "rewritten_query": state["question"],
+                "search_mode": mode, "reasoning": "Fallback routing used."}
+
+def _node_retrieve(state: RAGState) -> RAGState:
+    """Agent node: retrieve relevant chunks from FAISS."""
+    query = state["rewritten_query"]
+
+    if state["search_mode"] == "single" and state["pdf_stem"]:
+        index_path = INDEX_DIR / state["pdf_stem"]
+        if not index_path.exists():
+            logger.warning("[agent] single index not found: %s", index_path)
+            return {**state, "hits": []}
+        vs   = _load_vectorstore(index_path)
+        hits = _search(vs, query, 4)
+    else:
+        if not GLOBAL_INDEX_DIR.exists():
+            logger.warning("[agent] global index not found")
+            return {**state, "hits": []}
+        vs   = _load_vectorstore(GLOBAL_INDEX_DIR)
+        hits = _search(vs, query, 6)
+
+    logger.info("[agent] retrieved %d chunks mode=%s", len(hits), state["search_mode"])
+    return {**state, "hits": hits}
+
+def _node_generate(state: RAGState) -> RAGState:
+    """Agent node: generate grounded answer from retrieved context."""
+    if not state["hits"]:
+        return {**state, "answer": "I don't know based on the documents I have.", "citations": []}
+
+    # Rewritten query was for retrieval only — answer the original user question
+    result = _build_answer(state["question"], state["hits"], "", state["search_mode"])
+    return {**state, "answer": result["answer"], "citations": result["citations"]}
+
+def _build_rag_graph():
+    g = StateGraph(RAGState)
+    g.add_node("route",    _node_route_and_rewrite)
+    g.add_node("retrieve", _node_retrieve)
+    g.add_node("generate", _node_generate)
+    g.set_entry_point("route")
+    g.add_edge("route",    "retrieve")
+    g.add_edge("retrieve", "generate")
+    g.add_edge("generate", END)
+    return g.compile()
+
+_rag_graph = None
+def get_rag_graph():
+    global _rag_graph
+    if _rag_graph is None:
+        _rag_graph = _build_rag_graph()
+    return _rag_graph
+
+class AgentRequest(BaseModel):
+    question: str
+    pdf_stem: Optional[str] = None
+
+@app.post("/agent/answer")
+def agent_answer(req: AgentRequest, request: Request, user: dict = Depends(get_current_user)):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    logger.info("[agent/answer] question=%r pdf_stem=%r", req.question, req.pdf_stem)
+
+    available_docs = sorted(p.stem for p in UPLOAD_DIR.glob("*.pdf"))
+
+    initial_state: RAGState = {
+        "question":        req.question,
+        "pdf_stem":        req.pdf_stem,
+        "available_docs":  available_docs,
+        "rewritten_query": req.question,
+        "search_mode":     "single" if req.pdf_stem else "global",
+        "hits":            [],
+        "answer":          "",
+        "citations":       [],
+        "reasoning":       "",
+    }
+
+    result = get_rag_graph().invoke(initial_state)
+
+    return {
+        "request_id":      request.state.request_id,
+        "answer":          result["answer"],
+        "citations":       result["citations"],
+        "reasoning":       result["reasoning"],
+        "rewritten_query": result["rewritten_query"],
+        "search_mode":     result["search_mode"],
+        "mode":            "agent",
     }

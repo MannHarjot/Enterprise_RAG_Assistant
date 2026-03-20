@@ -11,3 +11,10 @@ venv/
 
 # Mac
 .DS_Store
+
+# Storage (uploaded files, indexes — not versioned)
+backend/storage/
+
+# Test / generation scripts and artifacts
+gen_test_pdf.py
+*.pdf

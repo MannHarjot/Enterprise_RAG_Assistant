@@ -13,6 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the app code
 COPY app ./app
 
+# Pre-download the ONNX embedding model so first requests aren't slow
+# and the container works offline / without HuggingFace rate limits
+RUN python -c "from fastembed import TextEmbedding; list(TextEmbedding('sentence-transformers/all-MiniLM-L6-v2').embed(['warmup']))"
+
 # Optional: create storage dirs (app also creates them)
 RUN mkdir -p storage/uploads storage/extracted storage/chunks storage/index
 

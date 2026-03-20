@@ -10,7 +10,12 @@ services:
     restart: unless-stopped
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        VITE_AUTH0_DOMAIN: dev-zhcct5kggw747lrl.us.auth0.com
+        VITE_AUTH0_CLIENT_ID: sXTpFnWSxv8LFtVdPQwO3iGclY1sLvNW
+        VITE_AUTH0_AUDIENCE: https://rag-assistant-api
     ports:
       - "3000:80"
     depends_on:
