@@ -287,6 +287,11 @@ def index_document(pdf_stem: str, request: Request, user: dict = Depends(get_cur
     if not chunks_file.exists():
         raise HTTPException(status_code=404, detail=f"No chunks found for '{pdf_stem}'. Upload PDF first.")
 
+    # Skip rebuild if index already exists and is newer than the chunks file
+    index_path = INDEX_DIR / pdf_stem
+    if index_path.exists() and index_path.stat().st_mtime >= chunks_file.stat().st_mtime:
+        return {"request_id": request.state.request_id, "status": "already_indexed", "pdf_stem": pdf_stem}
+
     data   = json.loads(chunks_file.read_text())
     chunks = data.get("chunks", [])
     if not chunks:
@@ -311,6 +316,12 @@ def index_global(request: Request, user: dict = Depends(get_current_user)):
     chunk_files = sorted(CHUNKS_DIR.glob("*.chunks.json"))
     if not chunk_files:
         raise HTTPException(status_code=400, detail="No PDFs uploaded yet.")
+
+    # Skip rebuild if global index exists and is newer than all chunk files
+    if GLOBAL_INDEX_DIR.exists():
+        newest_chunk = max(f.stat().st_mtime for f in chunk_files)
+        if GLOBAL_INDEX_DIR.stat().st_mtime >= newest_chunk:
+            return {"request_id": request.state.request_id, "status": "already_indexed_global"}
 
     all_docs = []
     for f in chunk_files:
