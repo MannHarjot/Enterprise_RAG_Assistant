@@ -6,7 +6,7 @@ An end-to-end Retrieval-Augmented Generation (RAG) application with Auth0 authen
 
 ## Live Demo
 
-> **URL:** *(add Render URL once deployed)*
+> **URL:** https://enterprise-rag-assistant-1.onrender.com/
 
 | Role | Email | Password |
 |---|---|---|
